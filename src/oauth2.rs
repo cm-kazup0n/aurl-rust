@@ -2,12 +2,13 @@ use rand::distributions::Alphanumeric;
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rand::Rng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,15 @@ use crate::profile::InvalidConfig;
 use crate::version;
 use reqwest::header::USER_AGENT;
 use std::io::Write;
+
+mod path_util {
+    use clap::lazy_static::lazy_static;
+    use regex::Regex;
+
+    lazy_static! {
+        pub static ref PATH_REGEX: Regex = Regex::new(".*?code=(?P<code>.+)&").unwrap();
+    }
+}
 
 pub struct OAuth2Config {
     pub auth_server_auth_endpoint: Option<String>,
@@ -210,6 +220,19 @@ mod test {
     use super::*;
 
     #[test]
+    fn test_regex_path() {
+        match path_util::PATH_REGEX
+            .captures("?hogehoge=fugafuga&code=ZZZZ-XXXX-CCCC&state=hogehoge")
+        {
+            Some(path) => {
+                let code = path.name("code").unwrap().as_str();
+                assert_eq!(code, "ZZZZ-XXXX-CCCC")
+            }
+            None => panic!("test failed"),
+        }
+    }
+
+    #[test]
     fn test_cache_path() {
         // setup
         let home = dirs::home_dir().unwrap();
@@ -319,8 +342,7 @@ mod test {
     #[test]
     #[should_panic]
     fn long_verifier_ng() {
-        GrantType::pkce_challenge(PkceMethod::S256,
-            "129aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        GrantType::pkce_challenge(PkceMethod::S256, "a".repeat(129).as_str());
     }
 }
 
@@ -424,18 +446,58 @@ impl GrantType {
 
                 webbrowser::open(url).unwrap();
 
-                // 3. Dummy URL で停止するので URL から認可コードを取得して入力
+                // 3. URL から認可コードを取得する
                 let mut auth_code = String::new();
 
-                loop {
-                    print!("\nEnter authorization code:");
-                    io::stdout().flush().unwrap();
-                    match io::stdin().read_line(&mut auth_code) {
-                        Ok(size) if size > 1 => break,
-                        Err(e) => warn!("{}", e),
-                        _ => (),
+                // 指定ポートで Callback 待ち構える
+                // TODO: port を可変にする
+                let server = TcpListener::bind("127.0.0.1:8080").unwrap();
+                for stream in server.incoming() {
+                    match stream {
+                        Ok(stream) => {
+                            let mut stream = io::BufReader::new(stream);
+                            let mut first_line = String::new();
+                            if let Err(error) = stream.read_line(&mut first_line) {
+                                error!("{}", error);
+                                break;
+                            }
+
+                            // スペースで分割
+                            let mut params = first_line.split_whitespace();
+                            let method = params.next();
+                            let path = params.next();
+                            let auth_code_result = match (method, path) {
+                                (Some("GET"), Some(path)) => {
+                                    let stream = stream.get_mut();
+                                    println!("path: {}", path);
+
+                                    if let Some(code) = path_util::PATH_REGEX.captures(path) {
+                                        let code = code.name("code").unwrap().as_str();
+
+                                        // ブラウザに空レスポンス
+                                        writeln!(stream, "HTTP/1.1 200 OK").unwrap();
+                                        writeln!(stream, "Content-Type: text/plain; charset=UTF-8")
+                                            .unwrap();
+                                        writeln!(stream, "{}", code).unwrap();
+                                        Ok(code)
+                                    } else {
+                                        Err("failed capture auth_code")
+                                    }
+                                }
+                                _ => Err("unknown Method"),
+                            };
+                            match auth_code_result {
+                                Ok(code) => auth_code = code.to_string(),
+                                Err(str) => error!("{}", str),
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            error!("Callback Server error");
+                        }
                     }
                 }
+
                 // 4. 認可コードをトークンエンドポイントへ POST. AccessToken を取得
                 http.post(config.auth_server_token_endpoint()?)
                     .basic_auth(config.client_id()?, config.client_secret.clone())

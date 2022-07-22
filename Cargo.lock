@@ -57,6 +57,7 @@ dependencies = [
  "log",
  "log4rs",
  "rand",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
